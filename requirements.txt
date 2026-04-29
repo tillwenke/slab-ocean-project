@@ -1,0 +1,10 @@
+numpy
+xarray
+dask
+netCDF4==1.7.2
+matplotlib
+cartopy
+ipywidgets
+jupyterlab
+notebook
+wrf-python
