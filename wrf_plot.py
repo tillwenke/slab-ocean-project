@@ -17,6 +17,7 @@ from matplotlib.collections import QuadMesh
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle
 from netCDF4 import Dataset
+from tqdm.auto import tqdm
 from wrf import ALL_TIMES, getvar
 
 
@@ -45,7 +46,7 @@ def load_wrf(pattern: str) -> xr.Dataset:
     ds = xr.open_mfdataset(files, combine="nested", concat_dim="Time")
 
     slp_frames = []
-    for path in files:
+    for path in tqdm(files, desc="computing slp", unit="file"):
         nc = Dataset(path)
         try:
             slp = getvar(nc, "slp", timeidx=ALL_TIMES)
@@ -420,10 +421,20 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
                     circle.center = (i, j)
         return ims + dots + circles + cut_lines
 
-    ani = animation.FuncAnimation(fig, update, frames=n_frames,
+    pbar = tqdm(total=n_frames, desc="rendering plot_time", unit="frame")
+    _update = update
+
+    def _tracked(frame: int) -> list[Any]:
+        artists = _update(frame)
+        pbar.update(1)
+        return artists
+
+    ani = animation.FuncAnimation(fig, _tracked, frames=n_frames,
                                   interval=interval, blit=False)
     plt.close(fig)
-    return HTML(ani.to_jshtml())
+    html = HTML(ani.to_jshtml())
+    pbar.close()
+    return html
 
 
 def plot_cross_section(data: dict[str, xr.DataArray], track: xr.Dataset,
@@ -510,10 +521,20 @@ def plot_cross_section(data: dict[str, xr.DataArray], track: xr.Dataset,
         return artists
 
     plt.tight_layout()
-    ani = animation.FuncAnimation(fig, update, frames=n_frames,
+    pbar = tqdm(total=n_frames, desc="rendering cross-section", unit="frame")
+    _update = update
+
+    def _tracked(frame: int) -> list[Any]:
+        artists = _update(frame)
+        pbar.update(1)
+        return artists
+
+    ani = animation.FuncAnimation(fig, _tracked, frames=n_frames,
                                   interval=interval, blit=False)
     plt.close(fig)
-    return HTML(ani.to_jshtml())
+    html = HTML(ani.to_jshtml())
+    pbar.close()
+    return html
 
 
 def multi_level_vars(ds: xr.Dataset,
