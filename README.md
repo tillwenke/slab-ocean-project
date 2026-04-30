@@ -20,6 +20,13 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+Copy `example.env` to `.env` and set your username:
+
+```bash
+cp example.env .env
+# edit .env and set USERNAME=<your_username>
+```
+
 Register the venv as a Jupyter kernel (optional, if you want to pick it
 from inside JupyterLab):
 
