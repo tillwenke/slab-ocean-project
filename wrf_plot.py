@@ -58,6 +58,13 @@ def load_wrf(pattern: str) -> xr.Dataset:
     slp_arr = np.concatenate(slp_frames, axis=0)
     ds["slp"] = (("Time", "south_north", "west_east"), slp_arr,
                  {"units": "hPa", "description": "sea level pressure"})
+    if all(var in ds for var in ("RAINC", "RAINSH", "RAINNC")):
+        ds["RAIN"] = ds["RAINC"] + ds["RAINSH"] + ds["RAINNC"]
+        ds["RAIN"].attrs["units"] = ds["RAINC"].attrs.get("units", "")
+        ds["RAIN"].attrs["description"] = (
+            "Total precipitation from convective, shallow convective, "
+            "and grid-scale processes"
+        )
     return ds
 
 
