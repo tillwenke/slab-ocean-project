@@ -290,7 +290,6 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
     first = next(iter(data.values()))
     n_frames = first.sizes[time_dim]
     assert all(arr.sizes[time_dim] == n_frames for arr in data.values())
-
     marker_ij = None
     radius_px: float | None = None
     if track is not None:
@@ -317,6 +316,15 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
                                   lat_np[1:, :], lon_np[1:, :]).mean()
             radius_px = float(radius / (0.5 * (dx_km + dy_km)))
 
+    if track is not None:
+        times = np.asarray(track["time"])
+    else:
+        times = None
+        for coord in first.coords.values():
+            if np.issubdtype(coord.dtype, np.datetime64):
+                times = np.asarray(coord)
+                break
+
     panels: list[tuple[str, xr.DataArray, str, float | None, float | None]] = [
         (title, arr, cmap, vmin, vmax) for title, arr in data.items()
     ]
@@ -331,6 +339,9 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
     rows = math.ceil(len(panels) / cols)
     fig = plt.figure(figsize=(plot_size * cols, plot_size * rows))
     fig.suptitle(fig_title, fontsize=14)
+    fig.subplots_adjust(top=0.90, bottom=0.07)
+    time_label = fig.text(0.5, 0.02, "", ha="center", va="bottom", fontsize=11,
+                          style="italic", color="0.3")
 
     use_geo = lat is not None and lon is not None
     lat_np = np.asarray(lat) if use_geo else None
@@ -394,6 +405,12 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
                 cut_lines.append(line)
 
     def update(frame: int) -> list[Any]:
+        if times is not None:
+            ts_str = str(times[frame])[:19].replace("T", " ")
+            stamp = ts_str
+        else:
+            stamp = f"{frame + 1} / {n_frames}"
+        time_label.set_text(stamp)
         for im, arr in zip(ims, arrs):
             vals = np.asarray(arr.isel({time_dim: frame}))
             if use_geo:
