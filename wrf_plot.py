@@ -58,12 +58,11 @@ def load_wrf(pattern: str) -> xr.Dataset:
     slp_arr = np.concatenate(slp_frames, axis=0)
     ds["slp"] = (("Time", "south_north", "west_east"), slp_arr,
                  {"units": "hPa", "description": "sea level pressure"})
-    if all(var in ds for var in ("RAINC", "RAINSH", "RAINNC")):
-        ds["RAIN"] = ds["RAINC"] + ds["RAINSH"] + ds["RAINNC"]
-        ds["RAIN"].attrs["units"] = ds["RAINC"].attrs.get("units", "")
-        ds["RAIN"].attrs["description"] = (
-            "Total precipitation from convective, shallow convective, "
-            "and grid-scale processes"
+    if all(var in ds for var in ("RAINC", "RAINNC")):
+        ds["PRECIP"] = ds["RAINC"] + ds["RAINNC"]
+        ds["PRECIP"].attrs["units"] = ds["RAINC"].attrs.get("units", "")
+        ds["PRECIP"].attrs["description"] = (
+            "Total precipitation from convective and grid-scale processes"
         )
     return ds
 
@@ -666,6 +665,114 @@ def plot_track_time(data: dict[str, xr.DataArray], track: xr.Dataset,
     ax.legend()
 
     plt.tight_layout()
+    return fig, series
+
+
+def plot_track_time_intersect(data: dict[str, xr.DataArray], track: xr.Dataset,
+                              lat: xr.DataArray, lon: xr.DataArray,
+                              fig_title: str = "", plot_size: float = 4,
+                              radius: float | None = None,
+                              time_dim: str = "Time"
+                              ) -> tuple[Figure, dict[str, np.ndarray]]:
+    """Like plot_track_time but also draws a vertical line at the first intersection.
+
+    If the two series cross, a vertical dashed line is drawn at that time with a
+    label showing the date/time of the intersection.  If there is no intersection
+    the plot is identical to plot_track_time.
+
+    Parameters
+    ----------
+    data : dict[str, xr.DataArray]
+        Mapping of panel title to a DataArray.  Exactly two entries are needed
+        for intersection detection; if more (or fewer) are passed the intersection
+        marker is silently skipped.
+    track : xr.Dataset
+        Storm track from ``storm_track``.
+    lat, lon : xr.DataArray
+        2D WRF latitude/longitude grids.
+    fig_title : str, default ""
+        Figure suptitle prefix.
+    plot_size : float, default 4
+        Size (in inches) of the plot height; width is 1.6× height.
+    radius : float, optional
+        If given, average values within this radius (km) of the center.
+    time_dim : str, default "Time"
+        Name of the time dimension in each DataArray.
+
+    Returns
+    -------
+    tuple[matplotlib.figure.Figure, dict[str, np.ndarray]]
+        ``(figure, series)`` — the matplotlib Figure and a dict mapping
+        panel title to the per-time 1D array of values.
+    """
+    first = next(iter(data.values()))
+    n_frames = first.sizes[time_dim]
+    assert all(arr.sizes[time_dim] == n_frames for arr in data.values())
+    assert track.sizes["time"] == n_frames, (
+        f"Track has {track.sizes['time']} steps, data has {n_frames}."
+    )
+
+    lat_np = np.asarray(lat)
+    lon_np = np.asarray(lon)
+    ctr_lat = np.asarray(track["lat"])
+    ctr_lon = np.asarray(track["lon"])
+    times = np.asarray(track["time"])
+
+    series = {title: np.empty(n_frames) for title in data}
+    for t in range(n_frames):
+        dist_km = _haversine_km(lat_np, lon_np, ctr_lat[t], ctr_lon[t])
+        if radius is None:
+            j, i = np.unravel_index(np.argmin(dist_km), dist_km.shape)
+            for title, arr in data.items():
+                series[title][t] = float(np.asarray(arr.isel({time_dim: t}))[j, i])
+        else:
+            mask = dist_km <= radius
+            for title, arr in data.items():
+                vals = np.asarray(arr.isel({time_dim: t}))
+                series[title][t] = float(np.nanmean(vals[mask]))
+
+    fig, ax = plt.subplots(figsize=(plot_size * 1.6, plot_size))
+    suffix = " at storm center" if radius is None else f" averaged within {radius} km"
+    ax.set_title(fig_title + suffix if fig_title else suffix.strip(), fontsize=14)
+
+    for title, vals in series.items():
+        ax.plot(times, vals, label=title)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis="x", rotation=30)
+    ax.legend()
+
+    plt.tight_layout()
+
+    # Find and mark the first two intersections (after 2016-10-04) when exactly two series are present.
+    if len(series) == 2:
+        import datetime as _dt
+        _cutoff = _dt.datetime(2016, 10, 4)
+        (title_a, vals_a), (title_b, vals_b) = list(series.items())
+        diff = vals_a.astype(float) - vals_b.astype(float)
+        sign_changes = np.where(np.diff(np.sign(diff)))[0]
+        _marked = 0
+        for idx in sign_changes:
+            if _marked >= 2:
+                break
+            d0, d1 = diff[idx], diff[idx + 1]
+            frac = abs(d0) / (abs(d0) + abs(d1)) if (abs(d0) + abs(d1)) > 0 else 0.5
+            t0_f = float(np.datetime64(times[idx], "ns").astype(np.float64))
+            t1_f = float(np.datetime64(times[idx + 1], "ns").astype(np.float64))
+            t_cross_dt = np.datetime64(int(t0_f + frac * (t1_f - t0_f)), "ns") \
+                           .astype("datetime64[s]").astype(object)
+            if t_cross_dt <= _cutoff:
+                continue
+            ax.axvline(t_cross_dt, color="black", linestyle="--", linewidth=1.2, zorder=3)
+            from matplotlib.transforms import ScaledTranslation
+            _nudge = ScaledTranslation(5 / 72, 0, fig.dpi_scale_trans)
+            ax.text(
+                t_cross_dt, 0.02,
+                t_cross_dt.strftime('%Y-%m-%d %H:%M'),
+                rotation=90, va="bottom", ha="left", fontsize=9, color="black",
+                transform=ax.get_xaxis_transform() + _nudge,
+            )
+            _marked += 1
+
     return fig, series
 
 
