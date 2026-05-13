@@ -7,6 +7,7 @@ import math
 from typing import Any
 
 import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
@@ -64,6 +65,14 @@ def load_wrf(pattern: str) -> xr.Dataset:
         ds["PRECIP"].attrs["description"] = (
             "Total precipitation from convective and grid-scale processes"
         )
+
+    if "TSK" in ds and "LANDMASK" in ds:
+        ds["TSK_OCEAN"] = ds["TSK"].where(ds["LANDMASK"] == 0)
+        ds["TSK_OCEAN"].attrs["units"] = ds["TSK"].attrs.get("units", "K")
+        ds["TSK_OCEAN"].attrs["description"] = (
+            "Skin temperature over ocean only (NaN over land)"
+        )
+
     return ds
 
 
@@ -247,12 +256,14 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
               plot_size: float = 4, cols: int = 4, cmap: str = "gray_r",
               vmin: float | None = None, vmax: float | None = None,
               time_dim: str = "Time", interval: int = 250,
-              track: xr.Dataset | None = None,
+              track: xr.Dataset | list[xr.Dataset | None] | None = None,
               lat: xr.DataArray | None = None,
               lon: xr.DataArray | None = None,
               radius: float | None = None,
               coastlines: bool = True,
-              cut_line: bool = False) -> HTML:
+              cut_line: bool = False,
+              show_track_line: bool = False,
+              mark_min_slp: bool = False) -> HTML:
     """Build an animated multi-panel ``imshow`` of fields over time.
 
     If ``track`` is given together with the 2D WRF ``lat``/``lon`` grids,
@@ -296,25 +307,25 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
     first = next(iter(data.values()))
     n_frames = first.sizes[time_dim]
     assert all(arr.sizes[time_dim] == n_frames for arr in data.values())
-    marker_ij = None
+
+    if isinstance(track, list):
+        assert len(track) == len(data), (
+            f"Got {len(track)} tracks for {len(data)} data entries."
+        )
+        data_tracks: list[xr.Dataset | None] = list(track)
+    elif track is None:
+        data_tracks = [None] * len(data)
+    else:
+        data_tracks = [track] * len(data)
+
+    any_track = next((t for t in data_tracks if t is not None), None)
     radius_px: float | None = None
-    if track is not None:
+    if any_track is not None:
         assert lat is not None and lon is not None, (
             "`lat` and `lon` are required when passing `track`."
         )
-        assert track.sizes["time"] == n_frames, (
-            f"Track has {track.sizes['time']} steps, data has {n_frames}."
-        )
         lat_np = np.asarray(lat)
         lon_np = np.asarray(lon)
-        ctr_lat = np.asarray(track["lat"])
-        ctr_lon = np.asarray(track["lon"])
-        marker_ij = np.empty((n_frames, 2), dtype=int)
-        for t in range(n_frames):
-            d2 = (lat_np - ctr_lat[t]) ** 2 + (lon_np - ctr_lon[t]) ** 2
-            j, i = np.unravel_index(np.argmin(d2), d2.shape)
-            marker_ij[t] = (j, i)
-
         if radius is not None and radius > 0:
             dx_km = _haversine_km(lat_np[:, :-1], lon_np[:, :-1],
                                   lat_np[:, 1:], lon_np[:, 1:]).mean()
@@ -322,8 +333,21 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
                                   lat_np[1:, :], lon_np[1:, :]).mean()
             radius_px = float(radius / (0.5 * (dx_km + dy_km)))
 
-    if track is not None:
-        times = np.asarray(track["time"])
+    def _marker_ij_for(tr: xr.Dataset) -> np.ndarray:
+        assert tr.sizes["time"] == n_frames, (
+            f"Track has {tr.sizes['time']} steps, data has {n_frames}."
+        )
+        ctr_lat = np.asarray(tr["lat"])
+        ctr_lon = np.asarray(tr["lon"])
+        mij = np.empty((n_frames, 2), dtype=int)
+        for t in range(n_frames):
+            d2 = (lat_np - ctr_lat[t]) ** 2 + (lon_np - ctr_lon[t]) ** 2
+            j, i = np.unravel_index(np.argmin(d2), d2.shape)
+            mij[t] = (j, i)
+        return mij
+
+    if any_track is not None:
+        times = np.asarray(any_track["time"])
     else:
         times = None
         for coord in first.coords.values():
@@ -331,15 +355,19 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
                 times = np.asarray(coord)
                 break
 
-    panels: list[tuple[str, xr.DataArray, str, float | None, float | None]] = [
-        (title, arr, cmap, vmin, vmax) for title, arr in data.items()
+    panels: list[tuple[str, xr.DataArray, str, float | None, float | None, str]] = [
+        (title, arr, cmap, vmin, vmax, arr.attrs.get("units", ""))
+        for title, arr in data.items()
     ]
+    panel_tracks: list[xr.Dataset | None] = list(data_tracks)
     if len(data) >= 2:
         items = list(data.items())
-        (t0, a0), (t1, a1) = items[0], items[1]
+        (_, a0), (_, a1) = items[0], items[1]
         diff = a0 - a1
         dmax = float(np.nanmax(np.abs(np.asarray(diff))))
-        panels.append((f"{t0} − {t1}", diff, "RdBu_r", -dmax, dmax))
+        diff_unit = a0.attrs.get("units", "")
+        panels.append(("Difference", diff, "RdBu_r", -dmax, dmax, diff_unit))
+        panel_tracks.append(data_tracks[0])
 
     cols = min(cols, len(panels))
     rows = math.ceil(len(panels) / cols)
@@ -353,8 +381,15 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
     lat_np = np.asarray(lat) if use_geo else None
     lon_np = np.asarray(lon) if use_geo else None
 
-    ims, arrs, dots, circles, cut_lines = [], [], [], [], []
-    for i, (title, arr, panel_cmap, p_vmin, p_vmax) in enumerate(panels):
+    ims, arrs = [], []
+    panel_dots: list[Any] = [None] * len(panels)
+    panel_circles: list[Any] = [None] * len(panels)
+    panel_cut_lines: list[Any] = [None] * len(panels)
+    panel_marker_ij: list[np.ndarray | None] = [None] * len(panels)
+    for i, (title, arr, panel_cmap, p_vmin, p_vmax, unit) in enumerate(panels):
+        ptrack = panel_tracks[i]
+        if ptrack is not None:
+            panel_marker_ij[i] = _marker_ij_for(ptrack)
         if use_geo:
             ax = fig.add_subplot(rows, cols, i + 1,
                                  projection=ccrs.PlateCarree())
@@ -374,41 +409,68 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
             ax.set_title(title)
             im = ax.imshow(arr.isel({time_dim: 0}), origin="lower",
                            cmap=panel_cmap, vmin=p_vmin, vmax=p_vmax)
-        plt.colorbar(im, ax=ax, orientation="vertical",
-                     pad=0.02, aspect=16, shrink=0.75)
+        cb = plt.colorbar(im, ax=ax, orientation="vertical",
+                          pad=0.02, aspect=16, shrink=0.75)
+        if unit:
+            cb.set_label(unit)
         ims.append(im)
         arrs.append(arr)
-        if marker_ij is not None:
+        if ptrack is not None and show_track_line:
+            tr_lat = np.asarray(ptrack["lat"])
+            tr_lon = np.asarray(ptrack["lon"])
             if use_geo:
-                lat0 = float(np.asarray(track["lat"])[0])
-                lon0 = float(np.asarray(track["lon"])[0])
+                ax.plot(tr_lon, tr_lat, "-", color="lightcoral",
+                        linewidth=1.2, alpha=0.7,
+                        transform=ccrs.PlateCarree())
+            else:
+                mij_full = panel_marker_ij[i]
+                ax.plot(mij_full[:, 1], mij_full[:, 0], "-",
+                        color="lightcoral", linewidth=1.2, alpha=0.7)
+        if ptrack is not None:
+            if use_geo:
+                lat0 = float(np.asarray(ptrack["lat"])[0])
+                lon0 = float(np.asarray(ptrack["lon"])[0])
                 (dot,) = ax.plot(lon0, lat0, "o", color="red", markersize=8,
                                  markeredgecolor="white", markeredgewidth=1.2,
                                  transform=ccrs.PlateCarree())
             else:
-                j0, i0 = marker_ij[0]
+                j0, i0 = panel_marker_ij[i][0]
                 (dot,) = ax.plot(i0, j0, "o", color="red", markersize=8,
                                  markeredgecolor="white", markeredgewidth=1.2)
-            dots.append(dot)
+            panel_dots[i] = dot
             if radius_px is not None and not use_geo:
                 circle = Circle((i0, j0), radius_px, fill=False,
                                 edgecolor="red", linewidth=1.2,
                                 alpha=0.4, linestyle="--")
                 ax.add_patch(circle)
-                circles.append(circle)
+                panel_circles[i] = circle
             elif radius is not None and radius > 0 and use_geo:
                 circle = Circle((lon0, lat0), radius / 111.0, fill=False,
                                 edgecolor="red", linewidth=1.2,
                                 alpha=0.4, linestyle="--",
                                 transform=ccrs.PlateCarree())
                 ax.add_patch(circle)
-                circles.append(circle)
+                panel_circles[i] = circle
             if cut_line and radius is not None and radius > 0 and use_geo:
                 rdeg = radius / 111.0
                 (line,) = ax.plot([lon0 - rdeg, lon0 + rdeg], [lat0, lat0],
                                   color="red", linewidth=1.5, alpha=0.8,
                                   transform=ccrs.PlateCarree())
-                cut_lines.append(line)
+                panel_cut_lines[i] = line
+            if mark_min_slp and "slp_min" in ptrack:
+                f_min = int(np.argmin(np.asarray(ptrack["slp_min"])))
+                if use_geo:
+                    lat_m = float(np.asarray(ptrack["lat"])[f_min])
+                    lon_m = float(np.asarray(ptrack["lon"])[f_min])
+                    ax.plot(lon_m, lat_m, marker="*", markersize=14,
+                            color="gold", markeredgecolor="black",
+                            markeredgewidth=1.0, linestyle="None",
+                            transform=ccrs.PlateCarree())
+                else:
+                    j_m, i_m = panel_marker_ij[i][f_min]
+                    ax.plot(i_m, j_m, marker="*", markersize=14,
+                            color="gold", markeredgecolor="black",
+                            markeredgewidth=1.0, linestyle="None")
 
     def update(frame: int) -> list[Any]:
         if times is not None:
@@ -423,26 +485,29 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
                 im.set_array(vals.ravel())
             else:
                 im.set_data(vals)
-        if marker_ij is not None:
+        for p, ptrack in enumerate(panel_tracks):
+            if ptrack is None:
+                continue
             if use_geo:
-                lat_t = float(np.asarray(track["lat"])[frame])
-                lon_t = float(np.asarray(track["lon"])[frame])
-                for dot in dots:
-                    dot.set_data([lon_t], [lat_t])
-                for circle in circles:
-                    circle.center = (lon_t, lat_t)
-                if cut_lines and radius is not None:
+                lat_t = float(np.asarray(ptrack["lat"])[frame])
+                lon_t = float(np.asarray(ptrack["lon"])[frame])
+                if panel_dots[p] is not None:
+                    panel_dots[p].set_data([lon_t], [lat_t])
+                if panel_circles[p] is not None:
+                    panel_circles[p].center = (lon_t, lat_t)
+                if panel_cut_lines[p] is not None and radius is not None:
                     rdeg = radius / 111.0
-                    for line in cut_lines:
-                        line.set_data([lon_t - rdeg, lon_t + rdeg],
-                                      [lat_t, lat_t])
+                    panel_cut_lines[p].set_data(
+                        [lon_t - rdeg, lon_t + rdeg], [lat_t, lat_t])
             else:
-                j, i = marker_ij[frame]
-                for dot in dots:
-                    dot.set_data([i], [j])
-                for circle in circles:
-                    circle.center = (i, j)
-        return ims + dots + circles + cut_lines
+                j, i = panel_marker_ij[p][frame]
+                if panel_dots[p] is not None:
+                    panel_dots[p].set_data([i], [j])
+                if panel_circles[p] is not None:
+                    panel_circles[p].center = (i, j)
+        extras = [a for a in panel_dots + panel_circles + panel_cut_lines
+                  if a is not None]
+        return ims + extras
 
     pbar = tqdm(total=n_frames, desc="rendering plot_time", unit="frame")
     _update = update
@@ -460,12 +525,138 @@ def plot_time(data: dict[str, xr.DataArray], fig_title: str = "",
     return html
 
 
-def plot_cross_section(data: dict[str, xr.DataArray], track: xr.Dataset,
-                       lat: xr.DataArray, lon: xr.DataArray, radius: float,
-                       fig_title: str = "", plot_size: float = 4,
+
+
+def plot_at_min_slp(data: dict[str, xr.DataArray],
+                    track: xr.Dataset | list[xr.Dataset],
+                    lat: xr.DataArray,
+                    lon: xr.DataArray,
+                    fig_title: str = "",
+                    plot_size: float = 7,
+                    cmap: str = "RdYlBu_r",
+                    vmin: float | None = None,
+                    vmax: float | None = None,
+                    cbar_label: str = "",
+                    radius: float = 400.0,
+                    time_dim: str = "Time") -> Figure:
+    """Snapshot of each field at the frame of its track's minimum SLP.
+
+    For every entry in ``data``, locates the time index where the
+    matching track's ``slp_min`` is lowest, then plots that 2D slice on
+    a PlateCarree map centered on the storm and zoomed to ``±radius``
+    km around it. A black ``x`` marks the storm center; the panel title
+    reports the min SLP value and time.
+
+    ``track`` may be a single Dataset (reused for all panels) or a list
+    matching ``data`` entry-for-entry. All panels share one horizontal
+    colorbar at the bottom of the figure.
+    """
+    items = list(data.items())
+    if isinstance(track, list):
+        assert len(track) == len(items), (
+            f"Got {len(track)} tracks for {len(items)} data entries."
+        )
+        tracks = list(track)
+    else:
+        tracks = [track] * len(items)
+
+    grid_lat = np.asarray(lat)
+    grid_lon = np.asarray(lon)
+    rdeg = radius / 111.0
+
+    # Build per-panel snapshots: (title, field, cmap, vmin, vmax,
+    #                             clat, clon, subtitle, is_diff)
+    first_unit = items[0][1].attrs.get("units", "") if items else ""
+    panels: list[tuple] = []
+    for (title, arr), tr in zip(items, tracks):
+        assert "slp_min" in tr, f"Track for '{title}' has no 'slp_min'."
+        slp_min = np.asarray(tr["slp_min"])
+        f_min = int(np.nanargmin(slp_min))
+        min_val = float(slp_min[f_min])
+        t_str = str(np.asarray(tr["time"])[f_min])[:19].replace("T", " ")
+        field = np.asarray(arr.isel({time_dim: f_min}))
+        clat = float(np.asarray(tr["lat"])[f_min])
+        clon = float(np.asarray(tr["lon"])[f_min])
+        subtitle = f"{title}\nMin SLP: {min_val:.1f} hPa at {t_str}"
+        panels.append((title, field, cmap, vmin, vmax,
+                       clat, clon, subtitle, False))
+
+    if len(items) >= 2:
+        (_, a0), (_, a1) = items[0], items[1]
+        tr0 = tracks[0]
+        f_min = int(np.nanargmin(np.asarray(tr0["slp_min"])))
+        f0 = np.asarray(a0.isel({time_dim: f_min}))
+        f1 = np.asarray(a1.isel({time_dim: f_min}))
+        diff = f0 - f1
+        dmax = float(np.nanmax(np.abs(diff))) or 1.0
+        clat = float(np.asarray(tr0["lat"])[f_min])
+        clon = float(np.asarray(tr0["lon"])[f_min])
+        t_str = str(np.asarray(tr0["time"])[f_min])[:19].replace("T", " ")
+        subtitle = f"Difference\nat {t_str}"
+        panels.append(("Difference", diff, "RdBu_r", -dmax, dmax,
+                       clat, clon, subtitle, True))
+
+    n = len(panels)
+    cols = min(3, n) if n > 2 else min(2, n)
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(plot_size * cols, plot_size * rows),
+                             subplot_kw={"projection": ccrs.PlateCarree()},
+                             squeeze=False)
+
+    data_im = None
+    for k, (_, field, panel_cmap, p_vmin, p_vmax,
+            clat, clon, subtitle, is_diff) in enumerate(panels):
+        ax = axes[k // cols][k % cols]
+        ax.set_extent([clon - rdeg, clon + rdeg,
+                       clat - rdeg, clat + rdeg],
+                      crs=ccrs.PlateCarree())
+        im = ax.pcolormesh(grid_lon, grid_lat, field, cmap=panel_cmap,
+                           vmin=p_vmin, vmax=p_vmax,
+                           transform=ccrs.PlateCarree(), shading="auto")
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=":")
+        ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3)
+        ax.plot(clon, clat, marker="x", color="black",
+                markersize=12, markeredgewidth=2.5,
+                transform=ccrs.PlateCarree(), zorder=5)
+        ax.set_title(subtitle, fontsize=13, fontweight="bold")
+        if is_diff:
+            cax_diff = ax.inset_axes([1.03, 0.05, 0.04, 0.9])
+            cb = fig.colorbar(im, cax=cax_diff, orientation="vertical")
+            diff_label = f"difference [{first_unit}]" if first_unit else "difference"
+            cb.set_label(diff_label, fontsize=11)
+        else:
+            data_im = im
+
+    for k in range(n, rows * cols):
+        axes[k // cols][k % cols].axis("off")
+
+    if fig_title:
+        fig.suptitle(fig_title, fontsize=16, fontweight="bold")
+    fig.subplots_adjust(bottom=0.18)
+    cbar_ax = fig.add_axes([0.25, 0.07, 0.50, 0.025])
+    cbar = fig.colorbar(data_im, cax=cbar_ax, orientation="horizontal")
+    label = cbar_label or first_unit
+    if label:
+        cbar.set_label(label, fontsize=13)
+    cbar.ax.tick_params(labelsize=12)
+    return fig
+
+
+
+def plot_cross_section(data: dict[str, xr.DataArray],
+                       track: xr.Dataset | list[xr.Dataset],
+                       lat: xr.DataArray, lon: xr.DataArray,
+                       radius: float,
+                       fig_title: str = "",
+                       plot_size: float = 4,
                        cmap: str = "viridis",
-                       vmin: float | None = None, vmax: float | None = None,
-                       time_dim: str = "Time", level_dim: str = "bottom_top",
+                       cmap_difference: str = "RdBu_r",
+                       vmin: float | None = None,
+                       vmax: float | None = None,
+                       time_dim: str = "Time",
+                       level_dim: str = "bottom_top",
                        interval: int = 250) -> HTML:
     """Animated zonal vertical cross-section through the storm center.
 
@@ -474,6 +665,10 @@ def plot_cross_section(data: dict[str, xr.DataArray], track: xr.Dataset,
     Only multi-level variables (with ``level_dim``) are accepted. If
     ``data`` has at least two entries, an extra panel showing
     ``first − second`` is appended with a diverging colormap.
+
+    ``track`` may be a single Dataset (used for all panels) or a list of
+    Datasets — one per entry in ``data`` — to follow a different storm
+    center per variable.
     """
     first = next(iter(data.values()))
     n_frames = first.sizes[time_dim]
@@ -482,33 +677,73 @@ def plot_cross_section(data: dict[str, xr.DataArray], track: xr.Dataset,
     assert all(level_dim in arr.dims for arr in data.values()), (
         f"All variables must have a '{level_dim}' dimension."
     )
-    assert track.sizes["time"] == n_frames
+
+    if isinstance(track, list):
+        assert len(track) == len(data), (
+            f"Got {len(track)} tracks for {len(data)} data entries."
+        )
+        tracks = list(track)
+    else:
+        tracks = [track] * len(data)
+    assert all(t.sizes["time"] == n_frames for t in tracks)
 
     lat_np = np.asarray(lat)
     lon_np = np.asarray(lon)
-    ctr_lat = np.asarray(track["lat"])
-    ctr_lon = np.asarray(track["lon"])
+    centers = [(np.asarray(t["lat"]), np.asarray(t["lon"])) for t in tracks]
     rdeg = radius / 111.0
 
-    def slab(arr: xr.DataArray, frame: int) -> tuple[np.ndarray, np.ndarray]:
+    # Fixed storm-relative longitude offset axis (degrees from center).
+    # Width chosen from the first panel's initial frame.
+    c_lat0, c_lon0 = centers[0]
+    j0, _ = np.unravel_index(
+        np.argmin((lat_np - c_lat0[0]) ** 2 + (lon_np - c_lon0[0]) ** 2),
+        lat_np.shape,
+    )
+    n_x = int(np.sum(np.abs(lon_np[j0, :] - c_lon0[0]) <= rdeg))
+    n_x = max(n_x, 8)
+    off_axis = np.linspace(-rdeg, rdeg, n_x)
+
+    def slab(arr: xr.DataArray, frame: int,
+             ctr_lat: np.ndarray, ctr_lon: np.ndarray
+             ) -> tuple[np.ndarray, np.ndarray]:
         d2 = (lat_np - ctr_lat[frame]) ** 2 + (lon_np - ctr_lon[frame]) ** 2
         j, _ = np.unravel_index(np.argmin(d2), d2.shape)
         lon_row = lon_np[j, :]
-        mask = np.abs(lon_row - ctr_lon[frame]) <= rdeg
-        idx = np.where(mask)[0]
-        vals = np.asarray(arr.isel({time_dim: frame}))
-        return vals[:, j, idx], lon_row[idx]
+        offsets = lon_row - ctr_lon[frame]
+        order = np.argsort(offsets)
+        offsets_sorted = offsets[order]
+        vals = np.asarray(arr.isel({time_dim: frame}))[:, j, :][:, order]
+        out = np.empty((vals.shape[0], n_x), dtype=float)
+        for lev in range(vals.shape[0]):
+            out[lev] = np.interp(off_axis, offsets_sorted, vals[lev],
+                                 left=np.nan, right=np.nan)
+        return out, off_axis
 
-    panels: list[tuple[str, xr.DataArray, str, float | None, float | None]] = [
-        (title, arr, cmap, vmin, vmax) for title, arr in data.items()
+    items = list(data.items())
+    panels: list[tuple[str, xr.DataArray, str, float | None, float | None,
+                       np.ndarray, np.ndarray, str]] = [
+        (title, arr, cmap, vmin, vmax, centers[i][0], centers[i][1],
+         arr.attrs.get("units", ""))
+        for i, (title, arr) in enumerate(items)
     ]
     if len(data) >= 2:
-        items = list(data.items())
-        (t0, a0), (t1, a1) = items[0], items[1]
+        (_, a0), (_, a1) = items[0], items[1]
+        c_lat_d, c_lon_d = centers[0]
+        # For the diff panel, both arrays are sampled along the FIRST track
+        # so they share a common reference frame.
         diff = a0 - a1
-        sample, _ = slab(diff, 0)
-        dmax = float(np.nanmax(np.abs(sample))) or 1.0
-        panels.append((f"{t0} − {t1}", diff, "RdBu_r", -dmax, dmax))
+        sample, _ = slab(diff, 0, c_lat_d, c_lon_d)
+        dmax = float(np.nanmax(np.abs(sample)))
+        panels.append(("Difference", diff, cmap_difference, -dmax, dmax,
+                       c_lat_d, c_lon_d, a0.attrs.get("units", "")))
+
+    times = np.asarray(tracks[0]["time"])
+    if not np.issubdtype(times.dtype, np.datetime64):
+        times = None
+        for coord in first.coords.values():
+            if np.issubdtype(coord.dtype, np.datetime64):
+                times = np.asarray(coord)
+                break
 
     cols = min(4, len(panels))
     rows = math.ceil(len(panels) / cols)
@@ -516,34 +751,45 @@ def plot_cross_section(data: dict[str, xr.DataArray], track: xr.Dataset,
                              figsize=(plot_size * 1.4 * cols, plot_size * rows),
                              squeeze=False)
     fig.suptitle(fig_title, fontsize=14)
+    fig.subplots_adjust(top=0.90, bottom=0.10)
+    time_label = fig.text(0.5, 0.02, "", ha="center", va="bottom", fontsize=11,
+                          style="italic", color="0.3")
 
-    ims, arrs = [], []
-    for k, (title, arr, panel_cmap, p_vmin, p_vmax) in enumerate(panels):
+    ims, arrs, panel_centers = [], [], []
+    for k, (title, arr, panel_cmap, p_vmin, p_vmax,
+            c_lat, c_lon, unit) in enumerate(panels):
         ax = axes[k // cols][k % cols]
-        slab0, lon0 = slab(arr, 0)
+        slab0, lon0 = slab(arr, 0, c_lat, c_lon)
         im = ax.pcolormesh(lon0, np.arange(n_levels), slab0, cmap=panel_cmap,
                            vmin=p_vmin, vmax=p_vmax, shading="auto")
+        ax.set_xlim(-rdeg, rdeg)
         ax.set_title(title)
-        ax.set_xlabel("longitude")
+        ax.set_xlabel("Δ longitude from storm center (deg)")
         ax.set_ylabel("model level")
-        plt.colorbar(im, ax=ax, orientation="vertical", pad=0.02,
-                     aspect=16, shrink=0.85)
+        cb = plt.colorbar(im, ax=ax, orientation="vertical", pad=0.02,
+                          aspect=16, shrink=0.85)
+        if unit:
+            cb.set_label(unit)
         ims.append((im, ax))
         arrs.append(arr)
+        panel_centers.append((c_lat, c_lon))
     for k in range(len(panels), rows * cols):
         axes[k // cols][k % cols].axis("off")
 
     def update(frame: int) -> list[Any]:
-        artists: list[Any] = []
-        for (im, ax), arr in zip(ims, arrs):
-            vals, lon_row = slab(arr, frame)
+        if times is not None:
+            stamp = str(times[frame])[:19].replace("T", " ")
+        else:
+            stamp = f"{frame + 1} / {n_frames}"
+        time_label.set_text(stamp)
+        artists: list[Any] = [time_label]
+        for (im, _), arr, (c_lat, c_lon) in zip(ims, arrs, panel_centers):
+            vals, _ = slab(arr, frame, c_lat, c_lon)
             im.set_array(vals.ravel())
-            im.set_clim(vmin=im.get_clim()[0], vmax=im.get_clim()[1])
-            ax.set_xlim(lon_row.min(), lon_row.max())
             artists.append(im)
         return artists
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
     pbar = tqdm(total=n_frames, desc="rendering cross-section", unit="frame")
     _update = update
 
@@ -594,11 +840,16 @@ def _haversine_km(lat_grid: np.ndarray, lon_grid: np.ndarray,
     return 2 * r * np.arcsin(np.sqrt(a))
 
 
-def plot_track_time(data: dict[str, xr.DataArray], track: xr.Dataset,
-                    lat: xr.DataArray, lon: xr.DataArray,
-                    fig_title: str = "", plot_size: float = 4,
+def plot_track_time(data: dict[str, xr.DataArray],
+                    track: xr.Dataset | list[xr.Dataset],
+                    lat: xr.DataArray,
+                    lon: xr.DataArray,
+                    fig_title: str = "",
+                    plot_size: float = 4,
                     radius: float | None = None,
-                    time_dim: str = "Time"
+                    time_dim: str = "Time",
+                    mark_min_slp: bool = False,
+                    agg: str = "avg",
                     ) -> tuple[Figure, dict[str, np.ndarray]]:
     """Line plots of values at (or averaged around) the storm center.
 
@@ -617,10 +868,19 @@ def plot_track_time(data: dict[str, xr.DataArray], track: xr.Dataset,
     plot_size : float, default 4
         Size (in inches) of the plot height; width is 1.6× height.
     radius : float, optional
-        If given, average values within this radius (km) of the center.
-        If omitted, the nearest-grid-point value is used.
+        Radius (km) around the storm center used by ``agg``. If omitted
+        and ``agg='avg'``, falls back to the nearest-grid-point value.
+        Required for ``agg='max'`` and ``agg='distance'``.
     time_dim : str, default "Time"
         Name of the time dimension in each DataArray.
+    mark_min_slp : bool, default False
+        If True, mark the time of each track's lowest ``slp_min`` with
+        a star on the corresponding line.
+    agg : {"avg", "max", "distance"}, default "avg"
+        How to reduce values inside ``radius`` to a single number per
+        frame: ``"avg"`` mean, ``"max"`` maximum, ``"distance"`` great-
+        circle distance (km) from the storm center to the location of
+        the maximum value within the radius.
 
     Returns
     -------
@@ -631,35 +891,78 @@ def plot_track_time(data: dict[str, xr.DataArray], track: xr.Dataset,
     first = next(iter(data.values()))
     n_frames = first.sizes[time_dim]
     assert all(arr.sizes[time_dim] == n_frames for arr in data.values())
-    assert track.sizes["time"] == n_frames, (
-        f"Track has {track.sizes['time']} steps, data has {n_frames}."
-    )
+
+    if isinstance(track, list):
+        assert len(track) == len(data), (
+            f"Got {len(track)} tracks for {len(data)} data entries."
+        )
+        data_tracks: list[xr.Dataset] = list(track)
+    else:
+        data_tracks = [track] * len(data)
+    for tr in data_tracks:
+        assert tr.sizes["time"] == n_frames, (
+            f"Track has {tr.sizes['time']} steps, data has {n_frames}."
+        )
 
     lat_np = np.asarray(lat)
     lon_np = np.asarray(lon)
-    ctr_lat = np.asarray(track["lat"])
-    ctr_lon = np.asarray(track["lon"])
-    times = np.asarray(track["time"])
+    times = np.asarray(data_tracks[0]["time"])
+
+    assert agg in ("avg", "max", "distance"), (
+        f"agg must be 'avg', 'max', or 'distance' (got {agg!r})."
+    )
+    if agg in ("max", "distance"):
+        assert radius is not None, f"agg={agg!r} requires `radius`."
 
     series = {title: np.empty(n_frames) for title in data}
-    for t in range(n_frames):
-        dist_km = _haversine_km(lat_np, lon_np, ctr_lat[t], ctr_lon[t])
-        if radius is None:
-            j, i = np.unravel_index(np.argmin(dist_km), dist_km.shape)
-            for title, arr in data.items():
-                series[title][t] = float(np.asarray(arr.isel({time_dim: t}))[j, i])
-        else:
+    for (title, arr), tr in zip(data.items(), data_tracks):
+        ctr_lat = np.asarray(tr["lat"])
+        ctr_lon = np.asarray(tr["lon"])
+        for t in range(n_frames):
+            dist_km = _haversine_km(lat_np, lon_np, ctr_lat[t], ctr_lon[t])
+            vals = np.asarray(arr.isel({time_dim: t}))
+            if radius is None:
+                j, i = np.unravel_index(np.argmin(dist_km), dist_km.shape)
+                series[title][t] = float(vals[j, i])
+                continue
             mask = dist_km <= radius
-            for title, arr in data.items():
-                vals = np.asarray(arr.isel({time_dim: t}))
+            if not np.any(mask):
+                series[title][t] = np.nan
+                continue
+            if agg == "avg":
                 series[title][t] = float(np.nanmean(vals[mask]))
+            elif agg == "max":
+                series[title][t] = float(np.nanmax(vals[mask]))
+            else:  # "distance"
+                masked_vals = np.where(mask, vals, np.nan)
+                if np.all(np.isnan(masked_vals)):
+                    series[title][t] = np.nan
+                else:
+                    j, i = np.unravel_index(np.nanargmax(masked_vals),
+                                            masked_vals.shape)
+                    series[title][t] = float(dist_km[j, i])
 
     fig, ax = plt.subplots(figsize=(plot_size * 1.6, plot_size))
-    suffix = " at storm center" if radius is None else f" averaged within {radius} km"
+    if radius is None:
+        suffix = " at storm center"
+    elif agg == "avg":
+        suffix = f" averaged within {radius} km radius"
+    elif agg == "max":
+        suffix = f" max within {radius} km radius"
+    else:
+        suffix = f" distance (km) of max within {radius} km radius"
     ax.set_title(fig_title + suffix if fig_title else suffix.strip(), fontsize=14)
 
-    for title, vals in series.items():
-        ax.plot(times, vals, label=title)
+    for ((title, vals), tr, (_, arr)) in zip(series.items(), data_tracks,
+                                              data.items()):
+        unit = arr.attrs.get("units", "") if agg != "distance" else "km"
+        label = f"{title} [{unit}]" if unit else title
+        (line,) = ax.plot(times, vals, label=label)
+        if mark_min_slp and "slp_min" in tr:
+            f_min = int(np.argmin(np.asarray(tr["slp_min"])))
+            ax.plot(times[f_min], vals[f_min], marker="*", markersize=14,
+                    color=line.get_color(), markeredgecolor="white",
+                    markeredgewidth=1.2, linestyle="None")
     ax.grid(True, alpha=0.3)
     ax.tick_params(axis="x", rotation=30)
     ax.legend()
@@ -773,6 +1076,195 @@ def plot_track_time_intersect(data: dict[str, xr.DataArray], track: xr.Dataset,
             )
             _marked += 1
 
+    return fig, series
+
+
+def plot_deepening_rate(data: dict[str, xr.DataArray],
+                        track: xr.Dataset | list[xr.Dataset],
+                        lat: xr.DataArray,
+                        lon: xr.DataArray,
+                        fig_title: str = "",
+                        plot_size: float = 4,
+                        radius: float | None = None,
+                        time_dim: str = "Time",
+                        mark_min_slp: bool = False,
+                        agg: str = "avg",
+                        cmap: str = "seismic_r",
+                        ylim_pad: float = 1.0,
+                        ) -> tuple[Figure, dict[str, np.ndarray]]:
+    """Per-panel time series colored segment-by-segment by deepening rate.
+
+    Same signature as :func:`plot_track_time` (one DataArray per panel,
+    one track per panel or shared, ``radius``/``agg`` to reduce inside
+    the storm radius) but each entry gets its own subplot stacked
+    vertically, and the line is colored by the local rate of change
+    (Δ value / Δ time per hour).
+
+    Markers: orange = max deepening (most negative rate), lime = overall
+    minimum value; merged into one pink marker if they coincide. If
+    ``mark_min_slp`` is True and the track carries ``slp_min``, the time
+    of that track's lowest ``slp_min`` is also marked with a star.
+
+    Returns ``(figure, series)`` like :func:`plot_track_time`.
+    """
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import TwoSlopeNorm
+    from matplotlib.lines import Line2D
+    import matplotlib.dates as mdates
+
+    first = next(iter(data.values()))
+    n_frames = first.sizes[time_dim]
+    assert all(arr.sizes[time_dim] == n_frames for arr in data.values())
+
+    if isinstance(track, list):
+        assert len(track) == len(data), (
+            f"Got {len(track)} tracks for {len(data)} data entries."
+        )
+        data_tracks: list[xr.Dataset] = list(track)
+    else:
+        data_tracks = [track] * len(data)
+    for tr in data_tracks:
+        assert tr.sizes["time"] == n_frames, (
+            f"Track has {tr.sizes['time']} steps, data has {n_frames}."
+        )
+
+    assert agg in ("avg", "max", "distance"), (
+        f"agg must be 'avg', 'max', or 'distance' (got {agg!r})."
+    )
+    if agg in ("max", "distance"):
+        assert radius is not None, f"agg={agg!r} requires `radius`."
+
+    lat_np = np.asarray(lat)
+    lon_np = np.asarray(lon)
+    times = np.asarray(data_tracks[0]["time"])
+
+    series = {title: np.empty(n_frames) for title in data}
+    for (title, arr), tr in zip(data.items(), data_tracks):
+        ctr_lat = np.asarray(tr["lat"])
+        ctr_lon = np.asarray(tr["lon"])
+        for t in range(n_frames):
+            dist_km = _haversine_km(lat_np, lon_np, ctr_lat[t], ctr_lon[t])
+            vals = np.asarray(arr.isel({time_dim: t}))
+            if radius is None:
+                j, i = np.unravel_index(np.argmin(dist_km), dist_km.shape)
+                series[title][t] = float(vals[j, i])
+                continue
+            mask = dist_km <= radius
+            if not np.any(mask):
+                series[title][t] = np.nan
+                continue
+            if agg == "avg":
+                series[title][t] = float(np.nanmean(vals[mask]))
+            elif agg == "max":
+                series[title][t] = float(np.nanmax(vals[mask]))
+            else:
+                masked_vals = np.where(mask, vals, np.nan)
+                if np.all(np.isnan(masked_vals)):
+                    series[title][t] = np.nan
+                else:
+                    j, i = np.unravel_index(np.nanargmax(masked_vals),
+                                            masked_vals.shape)
+                    series[title][t] = float(dist_km[j, i])
+
+    cases: list[dict[str, Any]] = []
+    for (title, vals), tr, (_, arr) in zip(series.items(), data_tracks,
+                                           data.items()):
+        unit = "km" if agg == "distance" else arr.attrs.get("units", "")
+        valid = np.isfinite(vals)
+        t_v = times[valid]; p_v = vals[valid]
+        dt_h = (np.diff(t_v).astype("timedelta64[s]").astype(float)) / 3600.0
+        dp = np.diff(p_v)
+        seg_ok = (dt_h > 0) & np.isfinite(dt_h) & np.isfinite(dp)
+        rate = dp[seg_ok] / dt_h[seg_ok]
+        x_all = mdates.date2num(t_v)
+        x0 = x_all[:-1][seg_ok]; x1 = x_all[1:][seg_ok]
+        p0 = p_v[:-1][seg_ok];   p1 = p_v[1:][seg_ok]
+        segments = np.stack([np.column_stack([x0, p0]),
+                             np.column_stack([x1, p1])], axis=1)
+        i_min = int(np.nanargmin(p_v)) if p_v.size else 0
+        if rate.size:
+            i_max = int(np.nanargmin(rate))
+            md_time = t_v[1:][seg_ok][i_max]
+            md_val = p_v[1:][seg_ok][i_max]
+        else:
+            md_time = t_v[i_min] if p_v.size else None
+            md_val = float(p_v[i_min]) if p_v.size else np.nan
+        cases.append({
+            "label": title, "track": tr, "time": t_v, "p": p_v, "rate": rate,
+            "segments": segments,
+            "max_deepening_time": md_time, "max_deepening_slp": md_val,
+            "min_slp_time": t_v[i_min] if p_v.size else None,
+            "min_slp": float(p_v[i_min]) if p_v.size else np.nan,
+            "unit": unit,
+        })
+
+    all_rates = np.concatenate([c["rate"] for c in cases]) if any(
+        c["rate"].size for c in cases) else np.array([1.0])
+    absmax = float(np.nanmax(np.abs(all_rates))) or 1.0
+    norm = TwoSlopeNorm(vmin=-absmax, vcenter=0.0, vmax=absmax)
+
+    n = len(cases)
+    fig, axes = plt.subplots(n, 1,
+                             figsize=(plot_size * 1.6, plot_size * n),
+                             sharex=True, squeeze=False)
+    axes = axes[:, 0]
+
+    lc = None
+    for ax, c in zip(axes, cases):
+        if c["segments"].size:
+            lc = LineCollection(c["segments"], cmap=cmap, norm=norm,
+                                linewidth=2.5)
+            lc.set_array(c["rate"])
+            ax.add_collection(lc)
+        ax.plot(c["time"], c["p"], color="black", alpha=0.15, linewidth=1)
+
+        same = (c["max_deepening_time"] is not None
+                and c["max_deepening_time"] == c["min_slp_time"])
+        u = f" {c['unit']}" if c["unit"] else ""
+        if same:
+            ax.scatter(c["min_slp_time"], c["min_slp"], color="deeppink",
+                       edgecolor="black", s=70, zorder=5,
+                       label=f"Max deepening & Min: {c['min_slp']:.1f}{u}")
+        else:
+            if c["max_deepening_time"] is not None:
+                ax.scatter(c["max_deepening_time"], c["max_deepening_slp"],
+                           color="darkorange", edgecolor="black",
+                           s=70, zorder=5, label="Max deepening rate")
+            if c["min_slp_time"] is not None:
+                ax.scatter(c["min_slp_time"], c["min_slp"], color="lime",
+                           edgecolor="black", s=70, zorder=5,
+                           label=f"Min: {c['min_slp']:.1f}{u}")
+        if mark_min_slp and "slp_min" in c["track"]:
+            f_min = int(np.argmin(np.asarray(c["track"]["slp_min"])))
+            y = (c["p"][np.argmin(np.abs(c["time"] - times[f_min]))]
+                 if c["p"].size else 0)
+            ax.scatter(times[f_min], y, marker="*", color="gold",
+                       edgecolor="black", s=140, zorder=6,
+                       label="Min SLP (track)")
+
+        if c["p"].size:
+            ax.set_ylim(c["p"].min() - ylim_pad, c["p"].max() + ylim_pad)
+        ylabel = f"{c['label']} [{c['unit']}]" if c["unit"] else c["label"]
+        ax.set_ylabel(ylabel)
+        ax.set_title(c["label"])
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    axes[-1].set_xlim(times.min(), times.max())
+    axes[-1].xaxis.set_major_locator(mdates.DayLocator())
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Y"))
+    axes[-1].tick_params(axis="x", rotation=30)
+
+    if fig_title:
+        fig.suptitle(fig_title, fontsize=14)
+    plt.tight_layout(rect=[0, 0, 0.90, 0.96 if fig_title else 1.0])
+    if lc is not None:
+        cax = fig.add_axes([0.92, 0.15, 0.018, 0.70])
+        cbar = fig.colorbar(lc, cax=cax)
+        units_seen = {c["unit"] for c in cases if c["unit"]}
+        rate_unit = (f"{next(iter(units_seen))} h$^{{-1}}$"
+                     if len(units_seen) == 1 else "unit h$^{-1}$")
+        cbar.set_label(f"Rate of change [{rate_unit}]")
     return fig, series
 
 
