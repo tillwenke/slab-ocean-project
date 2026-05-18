@@ -57,7 +57,7 @@ def load_wrf(pattern: str) -> xr.Dataset:
         finally:
             nc.close()
     slp_arr = np.concatenate(slp_frames, axis=0)
-    ds["slp"] = (("Time", "south_north", "west_east"), slp_arr,
+    ds["SLP"] = (("Time", "south_north", "west_east"), slp_arr,
                  {"units": "hPa", "description": "sea level pressure"})
     if all(var in ds for var in ("RAINC", "RAINNC")):
         ds["PRECIP"] = ds["RAINC"] + ds["RAINNC"]
@@ -534,6 +534,8 @@ def plot_at_min_slp(data: dict[str, xr.DataArray],
                     fig_title: str = "",
                     plot_size: float = 7,
                     cmap: str = "RdYlBu_r",
+                    cmap_difference: str = "RdBu_r",
+                    diff_title: str = "Difference",
                     vmin: float | None = None,
                     vmax: float | None = None,
                     cbar_label: str = "",
@@ -567,6 +569,28 @@ def plot_at_min_slp(data: dict[str, xr.DataArray],
     # Build per-panel snapshots: (title, field, cmap, vmin, vmax,
     #                             clat, clon, subtitle, is_diff)
     first_unit = items[0][1].attrs.get("units", "") if items else ""
+
+    def _window(field: np.ndarray, clat: float, clon: float) -> np.ndarray:
+        d2 = (grid_lat - clat) ** 2 + (grid_lon - clon) ** 2
+        j, i = np.unravel_index(int(np.argmin(d2)), d2.shape)
+        dlat = float(np.mean(np.abs(np.diff(grid_lat[:, i]))))
+        dlon = float(np.mean(np.abs(np.diff(grid_lon[j, :]))))
+        hj = int(rdeg / dlat)
+        hi = int(rdeg / dlon)
+        jmax, imax = grid_lat.shape
+        return field[max(j - hj, 0):min(j + hj + 1, jmax),
+                     max(i - hi, 0):min(i + hi + 1, imax)]
+
+    # Shared colour scale derived from the first track's min-SLP snapshot.
+    ref_arr, ref_tr = items[0][1], tracks[0]
+    ref_fmin = int(np.nanargmin(np.asarray(ref_tr["slp_min"])))
+    ref_field = np.asarray(ref_arr.isel({time_dim: ref_fmin}))
+    ref_clat = float(np.asarray(ref_tr["lat"])[ref_fmin])
+    ref_clon = float(np.asarray(ref_tr["lon"])[ref_fmin])
+    ref_win = _window(ref_field, ref_clat, ref_clon)
+    shared_vmin = float(np.nanmin(ref_win)) if vmin is None else vmin
+    shared_vmax = float(np.nanmax(ref_win)) if vmax is None else vmax
+
     panels: list[tuple] = []
     for (title, arr), tr in zip(items, tracks):
         assert "slp_min" in tr, f"Track for '{title}' has no 'slp_min'."
@@ -577,24 +601,61 @@ def plot_at_min_slp(data: dict[str, xr.DataArray],
         field = np.asarray(arr.isel({time_dim: f_min}))
         clat = float(np.asarray(tr["lat"])[f_min])
         clon = float(np.asarray(tr["lon"])[f_min])
-        subtitle = f"{title}\nMin SLP: {min_val:.1f} hPa at {t_str}"
-        panels.append((title, field, cmap, vmin, vmax,
+        var_name = getattr(arr, "name", None) or ""
+        head = f"{title}: {var_name}" if var_name else title
+        subtitle = f"{head}\nMin SLP: {min_val:.1f} hPa at {t_str}"
+        panels.append((title, field, cmap, shared_vmin, shared_vmax,
                        clat, clon, subtitle, False))
 
+    diff_grid: tuple[np.ndarray, np.ndarray] | None = None
     if len(items) >= 2:
         (_, a0), (_, a1) = items[0], items[1]
-        tr0 = tracks[0]
-        f_min = int(np.nanargmin(np.asarray(tr0["slp_min"])))
-        f0 = np.asarray(a0.isel({time_dim: f_min}))
-        f1 = np.asarray(a1.isel({time_dim: f_min}))
-        diff = f0 - f1
+        tr0, tr1 = tracks[0], tracks[1]
+        f0_idx = int(np.nanargmin(np.asarray(tr0["slp_min"])))
+        f1_idx = int(np.nanargmin(np.asarray(tr1["slp_min"])))
+        f0 = np.asarray(a0.isel({time_dim: f0_idx}))
+        f1 = np.asarray(a1.isel({time_dim: f1_idx}))
+        clat0 = float(np.asarray(tr0["lat"])[f0_idx])
+        clon0 = float(np.asarray(tr0["lon"])[f0_idx])
+        clat1 = float(np.asarray(tr1["lat"])[f1_idx])
+        clon1 = float(np.asarray(tr1["lon"])[f1_idx])
+
+        def _center_idx(clat: float, clon: float) -> tuple[int, int]:
+            d2 = (grid_lat - clat) ** 2 + (grid_lon - clon) ** 2
+            return tuple(np.unravel_index(int(np.argmin(d2)), d2.shape))
+
+        j0, i0 = _center_idx(clat0, clon0)
+        j1, i1 = _center_idx(clat1, clon1)
+        dlat = float(np.mean(np.abs(np.diff(grid_lat[:, i0]))))
+        dlon = float(np.mean(np.abs(np.diff(grid_lon[j0, :]))))
+        hj = int(rdeg / dlat)
+        hi = int(rdeg / dlon)
+        sj0_lo, sj0_hi = j0 - hj, j0 + hj + 1
+        si0_lo, si0_hi = i0 - hi, i0 + hi + 1
+        sj1_lo, sj1_hi = j1 - hj, j1 + hj + 1
+        si1_lo, si1_hi = i1 - hi, i1 + hi + 1
+        # Clamp windows to grid and align widths between the two.
+        jmax, imax = grid_lat.shape
+        sj0_lo, sj1_lo = max(sj0_lo, 0), max(sj1_lo, 0)
+        si0_lo, si1_lo = max(si0_lo, 0), max(si1_lo, 0)
+        sj0_hi, sj1_hi = min(sj0_hi, jmax), min(sj1_hi, jmax)
+        si0_hi, si1_hi = min(si0_hi, imax), min(si1_hi, imax)
+        h_j = min(sj0_hi - sj0_lo, sj1_hi - sj1_lo)
+        h_i = min(si0_hi - si0_lo, si1_hi - si1_lo)
+        w0 = f0[sj0_lo:sj0_lo + h_j, si0_lo:si0_lo + h_i]
+        w1 = f1[sj1_lo:sj1_lo + h_j, si1_lo:si1_lo + h_i]
+        diff = w0 - w1
         dmax = float(np.nanmax(np.abs(diff))) or 1.0
-        clat = float(np.asarray(tr0["lat"])[f_min])
-        clon = float(np.asarray(tr0["lon"])[f_min])
-        t_str = str(np.asarray(tr0["time"])[f_min])[:19].replace("T", " ")
-        subtitle = f"Difference\nat {t_str}"
-        panels.append(("Difference", diff, "RdBu_r", -dmax, dmax,
-                       clat, clon, subtitle, True))
+        # Lay the diff on a synthetic grid centered at track 0's center,
+        # using the panel-0 spacing.
+        lat_w = clat0 + (np.arange(h_j) - (j0 - sj0_lo)) * dlat
+        lon_w = clon0 + (np.arange(h_i) - (i0 - si0_lo)) * dlon
+        diff_grid = (np.broadcast_to(lat_w[:, None], (h_j, h_i)),
+                     np.broadcast_to(lon_w[None, :], (h_j, h_i)))
+        t_str = str(np.asarray(tr0["time"])[f0_idx])[:19].replace("T", " ")
+        subtitle = f"{diff_title}\nat {t_str}"
+        panels.append((diff_title, diff, cmap_difference, -dmax, dmax,
+                       clat0, clon0, subtitle, True))
 
     n = len(panels)
     cols = min(3, n) if n > 2 else min(2, n)
@@ -604,43 +665,41 @@ def plot_at_min_slp(data: dict[str, xr.DataArray],
                              subplot_kw={"projection": ccrs.PlateCarree()},
                              squeeze=False)
 
-    data_im = None
     for k, (_, field, panel_cmap, p_vmin, p_vmax,
             clat, clon, subtitle, is_diff) in enumerate(panels):
         ax = axes[k // cols][k % cols]
         ax.set_extent([clon - rdeg, clon + rdeg,
                        clat - rdeg, clat + rdeg],
                       crs=ccrs.PlateCarree())
-        im = ax.pcolormesh(grid_lon, grid_lat, field, cmap=panel_cmap,
+        if is_diff and diff_grid is not None:
+            plot_lat, plot_lon = diff_grid
+        else:
+            plot_lat, plot_lon = grid_lat, grid_lon
+        im = ax.pcolormesh(plot_lon, plot_lat, field, cmap=panel_cmap,
                            vmin=p_vmin, vmax=p_vmax,
                            transform=ccrs.PlateCarree(), shading="auto")
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-        ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=":")
-        ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3)
+        if not is_diff:
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=":")
+            ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3)
         ax.plot(clon, clat, marker="x", color="black",
                 markersize=12, markeredgewidth=2.5,
                 transform=ccrs.PlateCarree(), zorder=5)
-        ax.set_title(subtitle, fontsize=13, fontweight="bold")
+        ax.set_title(subtitle)
+        cb = plt.colorbar(im, ax=ax, orientation="vertical", pad=0.02,
+                          fraction=0.035, shrink=0.6)
         if is_diff:
-            cax_diff = ax.inset_axes([1.03, 0.05, 0.04, 0.9])
-            cb = fig.colorbar(im, cax=cax_diff, orientation="vertical")
-            diff_label = f"difference [{first_unit}]" if first_unit else "difference"
-            cb.set_label(diff_label, fontsize=11)
+            label = cbar_label or first_unit or "difference"
         else:
-            data_im = im
+            label = cbar_label or first_unit
+        if label:
+            cb.set_label(label)
 
     for k in range(n, rows * cols):
         axes[k // cols][k % cols].axis("off")
 
     if fig_title:
-        fig.suptitle(fig_title, fontsize=16, fontweight="bold")
-    fig.subplots_adjust(bottom=0.18)
-    cbar_ax = fig.add_axes([0.25, 0.07, 0.50, 0.025])
-    cbar = fig.colorbar(data_im, cax=cbar_ax, orientation="horizontal")
-    label = cbar_label or first_unit
-    if label:
-        cbar.set_label(label, fontsize=13)
-    cbar.ax.tick_params(labelsize=12)
+        fig.suptitle(fig_title, fontsize=14)
     return fig
 
 
@@ -653,6 +712,7 @@ def plot_cross_section(data: dict[str, xr.DataArray],
                        plot_size: float = 4,
                        cmap: str = "viridis",
                        cmap_difference: str = "RdBu_r",
+                       diff_title: str = "Difference",
                        vmin: float | None = None,
                        vmax: float | None = None,
                        time_dim: str = "Time",
@@ -720,22 +780,57 @@ def plot_cross_section(data: dict[str, xr.DataArray],
         return out, off_axis
 
     items = list(data.items())
+    # Lock colour scales to the values seen at the first track's min-SLP frame
+    # (colorbars cannot change during an animation).
+    ref_fmin = int(np.nanargmin(np.asarray(tracks[0]["slp_min"])))
+    ref_slab, _ = slab(items[0][1], ref_fmin, centers[0][0], centers[0][1])
+    shared_vmin = float(np.nanmin(ref_slab)) if vmin is None else vmin
+    shared_vmax = float(np.nanmax(ref_slab)) if vmax is None else vmax
+    ref_slabs = [(title, slab(arr, ref_fmin, centers[i][0], centers[i][1])[0])
+                 for i, (title, arr) in enumerate(items)]
     panels: list[tuple[str, xr.DataArray, str, float | None, float | None,
                        np.ndarray, np.ndarray, str]] = [
-        (title, arr, cmap, vmin, vmax, centers[i][0], centers[i][1],
-         arr.attrs.get("units", ""))
+        (title, arr, cmap, shared_vmin, shared_vmax,
+         centers[i][0], centers[i][1], arr.attrs.get("units", ""))
         for i, (title, arr) in enumerate(items)
     ]
+    diff_spec: dict | None = None
     if len(data) >= 2:
         (_, a0), (_, a1) = items[0], items[1]
-        c_lat_d, c_lon_d = centers[0]
-        # For the diff panel, both arrays are sampled along the FIRST track
-        # so they share a common reference frame.
-        diff = a0 - a1
-        sample, _ = slab(diff, 0, c_lat_d, c_lon_d)
-        dmax = float(np.nanmax(np.abs(sample)))
-        panels.append(("Difference", diff, cmap_difference, -dmax, dmax,
-                       c_lat_d, c_lon_d, a0.attrs.get("units", "")))
+        c0_lat, c0_lon = centers[0]
+        c1_lat, c1_lon = centers[1]
+        # Each array sampled along ITS OWN track, then differenced in
+        # storm-relative space — so two storms at different locations are
+        # still compared centre-to-centre.
+        s0_ref, _ = slab(a0, ref_fmin, c0_lat, c0_lon)
+        s1_ref, _ = slab(a1, ref_fmin, c1_lat, c1_lon)
+        ref_diff_slab = s0_ref - s1_ref
+        ref_slabs.append((diff_title, ref_diff_slab))
+        dmax = float(np.nanmax(np.abs(ref_diff_slab))) or 1.0
+        diff_spec = {
+            "title": diff_title,
+            "a0": a0, "a1": a1,
+            "c0": (c0_lat, c0_lon), "c1": (c1_lat, c1_lon),
+            "cmap": cmap_difference,
+            "vmin": -dmax, "vmax": dmax,
+            "unit": a0.attrs.get("units", ""),
+        }
+
+    dbg_n = len(ref_slabs)
+    dbg_fig, dbg_axes = plt.subplots(
+        1, dbg_n, figsize=(plot_size * 1.4 * dbg_n, plot_size), squeeze=False)
+    for ax, (title, s) in zip(dbg_axes[0], ref_slabs):
+        is_diff_panel = title == diff_title and len(ref_slabs) > len(items)
+        if is_diff_panel:
+            m = float(np.nanmax(np.abs(s))) or 1.0
+            im = ax.imshow(s, origin="lower", aspect="auto",
+                           cmap=cmap_difference, vmin=-m, vmax=m)
+        else:
+            im = ax.imshow(s, origin="lower", aspect="auto", cmap=cmap)
+        ax.set_title(f"{title} @ ref_fmin={ref_fmin}")
+        dbg_fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    dbg_fig.tight_layout()
+    plt.show()
 
     times = np.asarray(tracks[0]["time"])
     if not np.issubdtype(times.dtype, np.datetime64):
@@ -745,8 +840,9 @@ def plot_cross_section(data: dict[str, xr.DataArray],
                 times = np.asarray(coord)
                 break
 
-    cols = min(4, len(panels))
-    rows = math.ceil(len(panels) / cols)
+    total_panels = len(panels) + (1 if diff_spec is not None else 0)
+    cols = min(4, total_panels)
+    rows = math.ceil(total_panels / cols)
     fig, axes = plt.subplots(rows, cols,
                              figsize=(plot_size * 1.4 * cols, plot_size * rows),
                              squeeze=False)
@@ -773,7 +869,29 @@ def plot_cross_section(data: dict[str, xr.DataArray],
         ims.append((im, ax))
         arrs.append(arr)
         panel_centers.append((c_lat, c_lon))
-    for k in range(len(panels), rows * cols):
+
+    diff_im = None
+    if diff_spec is not None:
+        k = len(panels)
+        ax = axes[k // cols][k % cols]
+        s0_0, lon0 = slab(diff_spec["a0"], 0,
+                          diff_spec["c0"][0], diff_spec["c0"][1])
+        s1_0, _ = slab(diff_spec["a1"], 0,
+                       diff_spec["c1"][0], diff_spec["c1"][1])
+        diff_im = ax.pcolormesh(lon0, np.arange(n_levels), s0_0 - s1_0,
+                                cmap=diff_spec["cmap"],
+                                vmin=diff_spec["vmin"], vmax=diff_spec["vmax"],
+                                shading="auto")
+        ax.set_xlim(-rdeg, rdeg)
+        ax.set_title(diff_spec["title"])
+        ax.set_xlabel("Δ longitude from storm center (deg)")
+        ax.set_ylabel("model level")
+        cb = plt.colorbar(diff_im, ax=ax, orientation="vertical", pad=0.02,
+                          aspect=16, shrink=0.85)
+        if diff_spec["unit"]:
+            cb.set_label(diff_spec["unit"])
+
+    for k in range(total_panels, rows * cols):
         axes[k // cols][k % cols].axis("off")
 
     def update(frame: int) -> list[Any]:
@@ -787,6 +905,13 @@ def plot_cross_section(data: dict[str, xr.DataArray],
             vals, _ = slab(arr, frame, c_lat, c_lon)
             im.set_array(vals.ravel())
             artists.append(im)
+        if diff_im is not None and diff_spec is not None:
+            s0, _ = slab(diff_spec["a0"], frame,
+                         diff_spec["c0"][0], diff_spec["c0"][1])
+            s1, _ = slab(diff_spec["a1"], frame,
+                         diff_spec["c1"][0], diff_spec["c1"][1])
+            diff_im.set_array((s0 - s1).ravel())
+            artists.append(diff_im)
         return artists
 
     plt.tight_layout(rect=[0, 0.05, 1, 0.95])
